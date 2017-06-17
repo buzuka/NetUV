@@ -926,7 +926,7 @@ namespace NetUV.Core.Native
         static extern int uv_tcp_getsockname(IntPtr handle, out sockaddr sockaddr, ref int namelen);
 
         [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int uv_tcp_getpeername(IntPtr handle, out sockaddr name, ref int namelen);
+        static extern int uv_tcp_getpeername(IntPtr handle, out sockaddr name, ref int namelen);
 
         [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
         static extern int uv_tcp_nodelay(IntPtr handle, int enable);
