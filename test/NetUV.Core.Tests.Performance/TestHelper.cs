@@ -29,6 +29,13 @@ namespace NetUV.Core.Tests.Performance
             AnyEndPoint = new IPEndPoint(IPAddress.Any, Port);
         }
 
+        internal static string GetPipeName(string name)
+        {
+            return RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+                ? $"\\\\?\\pipe\\{name}"
+                : $"/tmp/{name}";
+        }
+
         internal static string Format(int value) => value.ToString("#,##0");
 
         internal static string Format(long value) => value.ToString("#,##0");

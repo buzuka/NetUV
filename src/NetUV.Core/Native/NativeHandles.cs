@@ -801,6 +801,13 @@ namespace NetUV.Core.Native
             return uv_pipe_pending_count(handle);
         }
 
+        internal static uv_handle_type PipePendingType(IntPtr handle)
+        {
+            Contract.Requires(handle != IntPtr.Zero);
+
+            return (uv_handle_type)uv_pipe_pending_type(handle);
+        }
+
         [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int uv_pipe_init(IntPtr loop, IntPtr handle, int ipc);
 
@@ -821,6 +828,9 @@ namespace NetUV.Core.Native
 
         [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
         static extern int uv_pipe_pending_count(IntPtr handle);
+
+        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+        static extern int uv_pipe_pending_type(IntPtr handle);
 
         #endregion Pipe
 
