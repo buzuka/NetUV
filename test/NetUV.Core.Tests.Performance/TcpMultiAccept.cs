@@ -4,6 +4,7 @@
 namespace NetUV.Core.Tests.Performance
 {
     using System;
+    using System.Runtime.InteropServices;
     using System.Text;
     using System.Threading;
     using NetUV.Core.Buffers;
@@ -12,39 +13,43 @@ namespace NetUV.Core.Tests.Performance
     sealed class TcpMultiAccept : IDisposable
     {
         static readonly string IpcPipeName =  TestHelper.GetPipeName("TEST_PIPENAME");
-        const int NumConnects = (250 * 1000);
+        const int NumConnects = 250 * 1000;
 
         readonly int serverCount;
         readonly int clientCount;
 
         sealed class ServerContext
         {
-            readonly SemaphoreSlim semaphore;
-            readonly Thread thread;
+            readonly ManualResetEventSlim resetEvent;
+            Thread thread;
 
             Loop loop;
             Async asyncHandle;
+            StreamHandle serverHandle;
 
             public ServerContext()
             {
                 this.Connects = 0;
-                this.semaphore = new SemaphoreSlim(0, 1);
+                this.resetEvent = new ManualResetEventSlim(false);
                 this.thread = new Thread(Start);
                 this.thread.Start(this);
             }
 
-            public ServerStream ServerHandle { get; set; }
-
             public int Connects { get; private set; }
 
-            public void Release()
+            public void Set()
             {
-                this.semaphore.Release(1);
+                this.resetEvent.Set();
             }
 
             public void Wait()
             {
-                this.semaphore.Wait();
+                this.resetEvent.Wait();
+            }
+
+            public void Send()
+            {
+                this.asyncHandle?.Send();
             }
 
             static void Start(object state)
@@ -58,14 +63,17 @@ namespace NetUV.Core.Tests.Performance
                 ctx.asyncHandle.RemoveReference();
 
                 // Wait until the main thread is ready.
-                ctx.semaphore.Wait();
+                ctx.resetEvent.Wait();
                 ctx.GetListenHandle();
-                ctx.Release();
+                ctx.resetEvent.Set();
 
                 // Now start the actual benchmark.
-                ctx.ServerHandle.StreamListen(ctx.OnServerConnection);
+                ((ServerStream)ctx.serverHandle).StreamListen(ctx.OnServerConnection);
                 ctx.loop.RunDefault();
                 ctx.loop.Dispose();
+
+                ctx.resetEvent.Set();
+                ctx.thread = null;
             }
 
             void OnServerConnection(StreamHandle handle, Exception exception)
@@ -93,14 +101,11 @@ namespace NetUV.Core.Tests.Performance
             void GetListenHandle()
             {
                 Pipe ipcPipe = this.loop.CreatePipe(true);
-                var context = new IpcClientContext(ipcPipe);
-                ipcPipe.UserToken = context;
-                ipcPipe.ConnectTo(IpcPipeName, OnIpcPipeConnected);
-
+                ipcPipe.ConnectTo(IpcPipeName, this.OnIpcPipeConnected);
                 this.loop.RunDefault();
             }
 
-            static void OnIpcPipeConnected(Pipe handle, Exception exception)
+            void OnIpcPipeConnected(Pipe handle, Exception exception)
             {
                 if (exception != null)
                 {
@@ -109,35 +114,21 @@ namespace NetUV.Core.Tests.Performance
                 }
                 else
                 {
-                    handle.OnRead(OnIpcPipeAccept, OnError);
+                    handle.OnRead(this.OnIpcPipeAccept, OnError);
                 }
             }
 
-            static void OnIpcPipeAccept(Pipe handle, ReadableBuffer readableBuffer)
+            void OnIpcPipeAccept(Pipe handle, ReadableBuffer readableBuffer)
             {
-                var context = (IpcClientContext)handle.UserToken;
-                context.ServerHandle = handle.CreatePendingType();
+                this.serverHandle = handle.CreatePendingType();
                 handle.CloseHandle();
             }
 
             static void OnAsync(Async handle)
             {
                 var ctx = (ServerContext)handle.UserToken;
-                ctx.ServerHandle.CloseHandle();
+                ctx.serverHandle.CloseHandle();
                 ctx.asyncHandle.CloseHandle();
-            }
-        }
-
-        sealed class IpcClientContext
-        {
-            static readonly byte[] Scratch = new byte[16];
-            readonly Pipe ipcPipe;
-
-            public StreamHandle ServerHandle { get; set; }
-
-            public IpcClientContext(Pipe ipcPipe)
-            {
-                this.ipcPipe = ipcPipe;
             }
         }
 
@@ -156,15 +147,27 @@ namespace NetUV.Core.Tests.Performance
                     .CreateTcp()
                     .Bind(TestHelper.LoopbackEndPoint);
 
-                this.ipcPipe = this.loop
-                    .CreatePipe(true)
-                    .Bind(IpcPipeName)
-                    .Listen(this.OnPipeConnection);
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                {
+                    this.ipcPipe = this.loop
+                        .CreatePipe()
+                        .Bind(IpcPipeName)
+                        .Listen(this.OnPipeConnection, 128, true);
+                }
+                else
+                {
+                    this.ipcPipe = this.loop
+                        .CreatePipe(true)
+                        .Bind(IpcPipeName)
+                        .Listen(this.OnPipeConnection);
+                }
 
                 this.connects = connects;
                 byte[] content = Encoding.UTF8.GetBytes("PING");
                 this.buf = WritableBuffer.From(content);
             }
+
+            public Loop LoopHandle => this.loop;
 
             public void Run()
             {
@@ -207,8 +210,72 @@ namespace NetUV.Core.Tests.Performance
             }
         }
 
+        sealed class ClientContext : IDisposable
+        {
+            int connects;
+            Loop loop;
+            Tcp tcp;
+            Idle idle;
+
+            public ClientContext(Loop loop, int connects)
+            {
+                this.tcp = loop
+                    .CreateTcp()
+                    .ConnectTo(TestHelper.LoopbackEndPoint, this.OnConnected);
+                this.idle = loop.CreateIdle();
+
+                this.loop = loop;
+                this.connects = connects;
+            }
+
+            void OnConnected(Tcp handle, Exception exception)
+            {
+                if (exception != null)
+                {
+                    //Console.WriteLine($"Tcp multi accept : client tcp connect error {exception}");
+                    handle.CloseHandle(this.OnClosed);
+                }
+                else
+                {
+                    this.connects--;
+                    this.idle.Start(this.OnIdle);
+                }
+            }
+
+            void OnIdle(Idle handle)
+            {
+                this.tcp.CloseHandle(this.OnClosed);
+                this.idle.Stop();
+            }
+
+            void OnClosed(Tcp handle)
+            {
+                if (this.connects == 0)
+                {
+                    this.idle.CloseHandle();
+                    return;
+                }
+
+                this.tcp = this.loop
+                    .CreateTcp()
+                    .ConnectTo(TestHelper.LoopbackEndPoint, this.OnConnected);
+            }
+
+            public void Dispose()
+            {
+                this.tcp?.CloseHandle();
+                this.tcp = null;
+
+                this.idle.CloseHandle();
+                this.idle = null;
+
+                this.loop = null;
+            }
+        }
+
         ServerContext[] servers;
         IpcServerContext ipcServer;
+        ClientContext[] clients;
 
         public TcpMultiAccept(int serverCount, int clientCount)
         {
@@ -226,7 +293,34 @@ namespace NetUV.Core.Tests.Performance
 
             this.SendListenHandles();
 
+            this.clients = new ClientContext[this.clientCount];
+            int connects = NumConnects / this.clientCount;
 
+            for (int i = 0; i < this.clientCount; i++)
+            {
+                this.clients[i] = new ClientContext(this.ipcServer.LoopHandle, connects);
+            }
+
+            long start = this.ipcServer.LoopHandle.NowInHighResolution;
+            this.ipcServer.LoopHandle.RunDefault();
+            start = this.ipcServer.LoopHandle.NowInHighResolution - start;
+
+            double time = (double)start / TestHelper.NanoSeconds;
+            for (int i = 0; i < this.serverCount; i++)
+            {
+                this.servers[i].Send();
+            }
+
+            for (int i = 0; i < this.serverCount; i++)
+            {
+                this.servers[i].Wait();
+            }
+
+            Console.WriteLine($"Tcp multi accept : {this.serverCount} {TestHelper.Format(NumConnects/time)} accepts/sec ({NumConnects} total).");
+            for (int i = 0; i < this.serverCount; i++)
+            {
+                Console.WriteLine($"Tcp multi accept : thread {i} {TestHelper.Format(this.servers[i].Connects / time)} accepts/sec ({this.servers[i].Connects} total) ({TestHelper.Format((this.servers[i].Connects * 100 )/ NumConnects)}) %.");
+            }
         }
 
         void SendListenHandles()
@@ -235,7 +329,7 @@ namespace NetUV.Core.Tests.Performance
 
             for (int i = 0; i < this.serverCount; i++)
             {
-                this.servers[i].Release();
+                this.servers[i].Set();
             }
 
             this.ipcServer.Run();
@@ -250,6 +344,9 @@ namespace NetUV.Core.Tests.Performance
         {
             this.ipcServer?.Dispose();
             this.ipcServer = null;
+
+            this.servers = null;
+            this.clients = null;
         }
     }
 }
